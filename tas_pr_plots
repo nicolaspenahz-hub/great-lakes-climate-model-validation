@@ -1,0 +1,786 @@
+# ------------------------------------------------------------
+# Annual climatology and CORDEX - CMIP5 comparison plots
+# ------------------------------------------------------------
+#
+# This script compares CaSR, CORDEX, and CMIP5 over the Great Lakes
+# region for the historical period 1980-2005.
+#
+# Main steps:
+# 1. Load regridded CaSR temperature and precipitation data.
+# 2. Load CORDEX and CMIP5 climatology files.
+# 3. Calculate annual mean surface air temperature and precipitation.
+# 4. Plot annual mean climatology maps.
+# 5. Calculate CORDEX - CMIP5 difference maps.
+# 6. Run paired t-tests for CORDEX - CMIP5 differences.
+# ------------------------------------------------------------
+
+
+# ------------------------------------------------------------
+# 1. Import packages
+# ------------------------------------------------------------
+
+import os
+import glob
+
+import numpy as np
+import xarray as xr
+import matplotlib.pyplot as plt
+import matplotlib as mpl
+
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+
+from scipy import stats
+
+
+# ------------------------------------------------------------
+# 2. Helper functions
+# ------------------------------------------------------------
+
+def add_model_id(ds):
+    """
+    Add the model_id attribute as a model coordinate.
+
+    This is needed when opening multiple model files with xarray.
+    It allows the files to be combined along a model dimension.
+    """
+    ds.coords["model"] = ds.attrs["model_id"]
+    return ds
+
+
+def add_map_features(ax):
+    """
+    Add coastlines, land, and Great Lakes outlines to a map.
+
+    The datasets are already on a regular latitude/longitude grid,
+    so PlateCarree is used for plotting.
+    """
+    ax.coastlines()
+    ax.add_feature(cfeature.LAND)
+    ax.add_feature(cfeature.COASTLINE)
+    ax.add_feature(cfeature.LAKES, linewidth=1, edgecolor="k", facecolor="none")
+
+    ax.set_xticks(np.arange(-180, 180, 5), crs=ccrs.PlateCarree())
+    ax.set_yticks(np.arange(-90, 90, 2), crs=ccrs.PlateCarree())
+
+
+# ------------------------------------------------------------
+# 3. File paths
+# ------------------------------------------------------------
+
+# Regridded CaSR files
+casr_tas_file = "/export/data/CaSR/daily/tas/tas_GLR_remap_daily.nc"
+casr_pr_file = "/export/data/CaSR/daily/pr/pr_GLR_remap_daily.nc"
+
+# CMIP5 climatology files
+cmip5_tas_path = "/export/data/CMIP5/NA-CORDEX/historical/tas/GL/monthly/average/ANN/*CLIM_remap.nc"
+cmip5_pr_path = "/export/data/CMIP5/NA-CORDEX/historical/pr/GL/monthly/average/*CLIM_remap.nc"
+
+# CORDEX climatology files
+cordex_tas_path = "/export/data/NA-CORDEX/daily/tas/remap/GL/monthly/average/ANN/*CLIM.nc"
+cordex_pr_path = "/export/data/NA-CORDEX/mon/pr/remap/mon/ANN/*CLIM_remap.nc"
+
+# Folder where figures will be saved
+figure_dir = "../figures"
+os.makedirs(figure_dir, exist_ok=True)
+
+
+# ------------------------------------------------------------
+# 4. Load CaSR data
+# ------------------------------------------------------------
+
+# CaSR is loaded at daily resolution and limited to the historical
+# period used in the study.
+tas_casr = xr.open_dataset(casr_tas_file).sel(time=slice("1980-01-01", "2005-12-31"))
+pr_casr = xr.open_dataset(casr_pr_file).sel(time=slice("1980-01-01", "2005-12-31"))
+
+# Extract the variables from the datasets.
+tas = tas_casr["tas"]
+pr = pr_casr["pr"]
+
+
+# ------------------------------------------------------------
+# 5. Calculate CaSR monthly climatologies
+# ------------------------------------------------------------
+
+# CaSR is daily, so the data are grouped by month and averaged
+# across all years from 1980 to 2005.
+tas_mon = tas.groupby("time.month").mean("time")
+pr_mon = pr.groupby("time.month").mean("time")
+
+
+# ------------------------------------------------------------
+# 6. Load CMIP5 and CORDEX model data
+# ------------------------------------------------------------
+
+# CMIP5 global climate model ensemble
+tas_cmip5 = xr.open_mfdataset(
+    cmip5_tas_path,
+    combine="nested",
+    concat_dim="model",
+    preprocess=add_model_id,
+    data_vars="minimal",
+    coords="minimal",
+    compat="override"
+)
+
+pr_cmip5 = xr.open_mfdataset(
+    cmip5_pr_path,
+    combine="nested",
+    concat_dim="model",
+    preprocess=add_model_id,
+    data_vars="minimal",
+    coords="minimal",
+    compat="override"
+)
+
+# CORDEX regional climate model ensemble
+tas_cordex = xr.open_mfdataset(
+    cordex_tas_path,
+    combine="nested",
+    concat_dim="model",
+    preprocess=add_model_id,
+    data_vars="minimal",
+    coords="minimal",
+    compat="override"
+)
+
+pr_cordex = xr.open_mfdataset(
+    cordex_pr_path,
+    combine="nested",
+    concat_dim="model",
+    preprocess=add_model_id,
+    data_vars="minimal",
+    coords="minimal",
+    compat="override"
+)
+
+print("CORDEX tas models:")
+print(tas_cordex.model.values)
+
+print("CORDEX pr models:")
+print(pr_cordex.model.values)
+
+
+# ------------------------------------------------------------
+# 7. Calculate annual mean surface air temperature
+# ------------------------------------------------------------
+
+# Temperature is converted from Kelvin to degrees Celsius by subtracting 273.15.
+casr_tas_annual = tas_mon.mean("month") - 273.15
+cordex_tas_annual = tas_cordex.tas.mean({"month", "model"}) - 273.15
+cmip5_tas_annual = tas_cmip5.tas.mean({"month", "model"}) - 273.15
+
+# Align datasets so that all three are compared on the same grid cells.
+casr_tas_annual, cordex_tas_annual, cmip5_tas_annual = xr.align(
+    casr_tas_annual,
+    cordex_tas_annual,
+    cmip5_tas_annual,
+    join="inner"
+)
+
+
+# ------------------------------------------------------------
+# 8. Plot annual mean surface air temperature
+# ------------------------------------------------------------
+
+fig, ax = plt.subplots(
+    1,
+    3,
+    subplot_kw={"projection": ccrs.PlateCarree()},
+    figsize=(11, 8.5)
+)
+
+ax = ax.flatten()
+
+# Fixed temperature scale used for comparison between datasets.
+tas_min = 0
+tas_max = 14
+tas_levels = np.arange(0, 15, 1)
+tas_ticks = np.arange(0, 15, 2)
+
+tas_data = [
+    (casr_tas_annual, "CaSR tas"),
+    (cordex_tas_annual, "CORDEX tas"),
+    (cmip5_tas_annual, "CMIP5 tas")
+]
+
+for i, (data, title) in enumerate(tas_data):
+    add_map_features(ax[i])
+
+    pc = ax[i].contourf(
+        data.lon,
+        data.lat,
+        data,
+        cmap="RdBu_r",
+        levels=tas_levels,
+        extend="neither"
+    )
+
+    cax, kw = mpl.colorbar.make_axes(
+        ax[i],
+        location="bottom",
+        pad=0.14,
+        shrink=1
+    )
+
+    out = fig.colorbar(
+        pc,
+        cax=cax,
+        extend="neither",
+        boundaries=tas_levels,
+        ticks=tas_ticks,
+        **kw
+    )
+
+    out.set_label("Surface air temperature ($^oC$)", size=10)
+    pc.set_clim(tas_min, tas_max)
+
+    ax[i].set_title(title, size=14)
+
+plt.savefig(f"{figure_dir}/Tas_plot.png", dpi=300, bbox_inches="tight")
+plt.show()
+
+
+# ------------------------------------------------------------
+# 9. Calculate annual mean precipitation
+# ------------------------------------------------------------
+
+# Precipitation is provided as a rate. Multiplying by 86400 converts
+# from per second to per day, and multiplying by days in each month
+# gives monthly totals in mm/month.
+days_in_month = xr.DataArray(
+    [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31],
+    coords={"month": np.arange(1, 13)},
+    dims="month"
+)
+
+casr_pr_annual = (pr_mon * 86400 * days_in_month).mean("month")
+cordex_pr_annual = (pr_cordex.pr * 86400 * days_in_month).mean({"month", "model"})
+cmip5_pr_annual = (pr_cmip5.pr * 86400 * days_in_month).mean({"month", "model"})
+
+# Align datasets to the same grid before plotting.
+casr_pr_annual, cordex_pr_annual, cmip5_pr_annual = xr.align(
+    casr_pr_annual,
+    cordex_pr_annual,
+    cmip5_pr_annual,
+    join="inner"
+)
+
+
+# ------------------------------------------------------------
+# 10. Plot annual mean precipitation
+# ------------------------------------------------------------
+
+fig, ax = plt.subplots(
+    1,
+    3,
+    subplot_kw={"projection": ccrs.PlateCarree()},
+    figsize=(11, 8.5)
+)
+
+ax = ax.flatten()
+
+# Use a shared precipitation scale for all three datasets.
+pr_max = np.ceil(
+    np.nanmax([
+        float(casr_pr_annual.max()),
+        float(cordex_pr_annual.max()),
+        float(cmip5_pr_annual.max())
+    ])
+)
+
+pr_levels = np.arange(0, pr_max + 5, 5)
+pr_ticks = np.arange(0, pr_max + 5, 20)
+
+pr_data = [
+    (casr_pr_annual, "CaSR pr"),
+    (cordex_pr_annual, "CORDEX pr"),
+    (cmip5_pr_annual, "CMIP5 pr")
+]
+
+for i, (data, title) in enumerate(pr_data):
+    add_map_features(ax[i])
+
+    pc = ax[i].contourf(
+        data.lon,
+        data.lat,
+        data,
+        cmap="RdBu_r",
+        levels=pr_levels,
+        extend="neither"
+    )
+
+    cax, kw = mpl.colorbar.make_axes(
+        ax[i],
+        location="bottom",
+        pad=0.07,
+        shrink=1
+    )
+
+    out = fig.colorbar(
+        pc,
+        cax=cax,
+        extend="neither",
+        boundaries=pr_levels,
+        ticks=pr_ticks,
+        **kw
+    )
+
+    out.set_label("Precipitation (mm/month)", size=10)
+    pc.set_clim(0, pr_levels[-1])
+
+    ax[i].set_title(title, size=14)
+
+plt.savefig(f"{figure_dir}/Pr_plot.png", dpi=300, bbox_inches="tight")
+plt.show()
+
+
+# ------------------------------------------------------------
+# 11. Calculate CORDEX - CMIP5 differences
+# ------------------------------------------------------------
+
+# Align CORDEX and CMIP5 before subtracting.
+cordex_tas_diff_data, cmip5_tas_diff_data = xr.align(
+    cordex_tas_annual,
+    cmip5_tas_annual,
+    join="inner"
+)
+
+cordex_pr_diff_data, cmip5_pr_diff_data = xr.align(
+    cordex_pr_annual,
+    cmip5_pr_annual,
+    join="inner"
+)
+
+# Positive values mean CORDEX is warmer or wetter than CMIP5.
+tas_diff = (cordex_tas_diff_data - cmip5_tas_diff_data).compute()
+pr_diff = (cordex_pr_diff_data - cmip5_pr_diff_data).compute()
+
+
+# ------------------------------------------------------------
+# 12. Plot CORDEX - CMIP5 temperature difference
+# ------------------------------------------------------------
+
+fig, ax = plt.subplots(
+    1,
+    1,
+    subplot_kw={"projection": ccrs.PlateCarree()},
+    figsize=(6, 5)
+)
+
+tas_diff_max = np.ceil(float(np.nanmax(np.abs(tas_diff))))
+
+tas_diff_levels = np.arange(-tas_diff_max, tas_diff_max + 0.5, 0.5)
+tas_diff_ticks = np.arange(-tas_diff_max, tas_diff_max + 1, 1)
+
+add_map_features(ax)
+
+pc = ax.contourf(
+    tas_diff.lon,
+    tas_diff.lat,
+    tas_diff,
+    cmap="RdBu_r",
+    levels=tas_diff_levels,
+    extend="neither"
+)
+
+cax, kw = mpl.colorbar.make_axes(ax, location="bottom", pad=0.07, shrink=1)
+
+out = fig.colorbar(
+    pc,
+    cax=cax,
+    extend="neither",
+    boundaries=tas_diff_levels,
+    ticks=tas_diff_ticks,
+    **kw
+)
+
+out.set_label("CORDEX - CMIP5 Tas difference ($^oC$)", size=10)
+pc.set_clim(-tas_diff_max, tas_diff_max)
+
+ax.set_title("CORDEX - CMIP5 Tas", size=14)
+
+plt.savefig(f"{figure_dir}/CORDEX_minus_CMIP5_Tas.png", dpi=300, bbox_inches="tight")
+plt.show()
+
+
+# ------------------------------------------------------------
+# 13. Plot CORDEX - CMIP5 precipitation difference
+# ------------------------------------------------------------
+
+fig, ax = plt.subplots(
+    1,
+    1,
+    subplot_kw={"projection": ccrs.PlateCarree()},
+    figsize=(6, 5)
+)
+
+pr_diff_max = np.ceil(float(np.nanmax(np.abs(pr_diff))) / 5) * 5
+
+pr_diff_levels = np.arange(-pr_diff_max, pr_diff_max + 5, 5)
+pr_diff_ticks = np.arange(-pr_diff_max, pr_diff_max + 5, 10)
+
+add_map_features(ax)
+
+pc = ax.contourf(
+    pr_diff.lon,
+    pr_diff.lat,
+    pr_diff,
+    cmap="RdBu_r",
+    levels=pr_diff_levels,
+    extend="neither"
+)
+
+cax, kw = mpl.colorbar.make_axes(ax, location="bottom", pad=0.07, shrink=1)
+
+out = fig.colorbar(
+    pc,
+    cax=cax,
+    extend="neither",
+    boundaries=pr_diff_levels,
+    ticks=pr_diff_ticks,
+    **kw
+)
+
+out.set_label("CORDEX - CMIP5 Pr difference (mm/month)", size=10)
+pc.set_clim(-pr_diff_max, pr_diff_max)
+
+ax.set_title("CORDEX - CMIP5 Pr", size=14)
+
+plt.savefig(f"{figure_dir}/CORDEX_minus_CMIP5_Pr.png", dpi=300, bbox_inches="tight")
+plt.show()
+
+
+# ------------------------------------------------------------
+# 14. Paired t-test for CORDEX - CMIP5 temperature differences
+# ------------------------------------------------------------
+
+# The paired t-test compares each CORDEX simulation with its matching
+# CMIP5 driving model. This tests whether the CORDEX - CMIP5 difference
+# is statistically different from zero across the paired model set.
+cordex_tas_files = sorted(glob.glob(cordex_tas_path))
+cmip5_tas_files = sorted(glob.glob(cmip5_tas_path))
+
+cmip5_tas_dict = {}
+
+# Build a dictionary linking CMIP5 model names to file paths.
+for f in cmip5_tas_files:
+    name = os.path.basename(f)
+    model_name = name.replace("Tas_CMIP5_", "").replace("_CLIM_remap.nc", "")
+    cmip5_tas_dict[model_name] = f
+
+paired_tas_diffs = []
+paired_names = []
+
+for f in cordex_tas_files:
+    name = os.path.basename(f)
+
+    # The driving model name is stored near the beginning of the CORDEX file name.
+    driving_model = name.replace("Tas_NAhist_", "").split("_")[0]
+
+    if driving_model in cmip5_tas_dict:
+        cordex_ds = xr.open_dataset(f)
+        cmip5_ds = xr.open_dataset(cmip5_tas_dict[driving_model])
+
+        # Drop height if present because it is not needed for surface variables.
+        if "height" in cordex_ds.coords:
+            cordex_ds = cordex_ds.drop_vars("height")
+
+        if "height" in cmip5_ds.coords:
+            cmip5_ds = cmip5_ds.drop_vars("height")
+
+        # Convert from Kelvin to Celsius and average over months.
+        cordex_one = cordex_ds.tas.mean("month") - 273.15
+        cmip5_one = cmip5_ds.tas.mean("month") - 273.15
+
+        cordex_one, cmip5_one = xr.align(cordex_one, cmip5_one, join="inner")
+
+        paired_tas_diffs.append(cordex_one - cmip5_one)
+        paired_names.append(name.replace(".nc", ""))
+
+paired_tas_diffs = xr.concat(
+    paired_tas_diffs,
+    dim="pair",
+    coords="minimal",
+    compat="override"
+)
+
+paired_tas_diffs = paired_tas_diffs.assign_coords(pair=paired_names)
+
+tas_diff_paired_mean = paired_tas_diffs.mean("pair").compute()
+
+tas_ttest_paired = stats.ttest_1samp(
+    paired_tas_diffs.transpose("pair", "lat", "lon").values,
+    0,
+    axis=0,
+    nan_policy="omit"
+)
+
+pvalue_tas_paired = xr.DataArray(
+    tas_ttest_paired.pvalue,
+    coords={"lat": tas_diff_paired_mean.lat, "lon": tas_diff_paired_mean.lon},
+    dims=["lat", "lon"]
+)
+
+pvalue_tas_paired = pvalue_tas_paired.fillna(1)
+
+print("Number of matched Tas pairs:")
+print(len(paired_names))
+
+print("Paired Tas difference min/max/mean:")
+print(
+    float(tas_diff_paired_mean.min()),
+    float(tas_diff_paired_mean.max()),
+    float(tas_diff_paired_mean.mean())
+)
+
+print("Paired Tas p-value min/max/mean:")
+print(
+    float(pvalue_tas_paired.min()),
+    float(pvalue_tas_paired.max()),
+    float(pvalue_tas_paired.mean())
+)
+
+print("Paired Tas percent significant:")
+print(float((pvalue_tas_paired < 0.05).mean() * 100))
+
+
+# ------------------------------------------------------------
+# 15. Plot paired temperature difference with significance hatching
+# ------------------------------------------------------------
+
+fig, ax = plt.subplots(
+    1,
+    1,
+    subplot_kw={"projection": ccrs.PlateCarree()},
+    figsize=(6, 5)
+)
+
+tas_pair_diff_max = np.ceil(float(np.nanmax(np.abs(tas_diff_paired_mean))))
+
+tas_pair_levels = np.arange(-tas_pair_diff_max, tas_pair_diff_max + 0.5, 0.5)
+tas_pair_ticks = np.arange(-tas_pair_diff_max, tas_pair_diff_max + 1, 1)
+
+add_map_features(ax)
+
+pc = ax.contourf(
+    tas_diff_paired_mean.lon,
+    tas_diff_paired_mean.lat,
+    tas_diff_paired_mean,
+    cmap="RdBu_r",
+    levels=tas_pair_levels,
+    extend="neither"
+)
+
+# Hatched areas indicate where p < 0.05.
+ax.contourf(
+    pvalue_tas_paired.lon,
+    pvalue_tas_paired.lat,
+    pvalue_tas_paired,
+    levels=[0, 0.05, 1],
+    colors="none",
+    hatches=["//", ""],
+    alpha=0
+)
+
+cax, kw = mpl.colorbar.make_axes(ax, location="bottom", pad=0.07, shrink=1)
+
+out = fig.colorbar(
+    pc,
+    cax=cax,
+    extend="neither",
+    boundaries=tas_pair_levels,
+    ticks=tas_pair_ticks,
+    **kw
+)
+
+out.set_label("CORDEX - CMIP5 Tas difference ($^oC$)", size=10)
+pc.set_clim(-tas_pair_diff_max, tas_pair_diff_max)
+
+ax.set_title("CORDEX - CMIP5 Tas T test", size=14)
+
+plt.savefig(f"{figure_dir}/CORDEX_minus_CMIP5_Tas_ttest.png", dpi=300, bbox_inches="tight")
+plt.show()
+
+
+# ------------------------------------------------------------
+# 16. Paired t-test for CORDEX - CMIP5 precipitation differences
+# ------------------------------------------------------------
+
+cordex_pr_files = sorted(glob.glob(cordex_pr_path))
+cmip5_pr_files = sorted(glob.glob(cmip5_pr_path))
+
+cmip5_pr_dict = {}
+
+# Build a dictionary linking CMIP5 precipitation file names
+# to their model names.
+for f in cmip5_pr_files:
+    name = os.path.basename(f)
+
+    if "CNRM" in name:
+        cmip5_pr_dict["CNRM-CM5"] = f
+    if "CanESM2" in name:
+        cmip5_pr_dict["CanESM2"] = f
+    if "GFDL" in name:
+        cmip5_pr_dict["GFDL-ESM2M"] = f
+    if "HadGEM2" in name:
+        cmip5_pr_dict["HadGEM2-ES"] = f
+    if "MPI_ESM_LR" in name or "MPI-ESM-LR" in name:
+        cmip5_pr_dict["MPI-ESM-LR"] = f
+    if "MPI_ESM_MR" in name or "MPI-ESM-MR" in name:
+        cmip5_pr_dict["MPI-ESM-MR"] = f
+
+paired_pr_diffs = []
+paired_pr_names = []
+
+for f in cordex_pr_files:
+    name = os.path.basename(f)
+
+    # Identify the CMIP5 driving model from the CORDEX file name.
+    driving_model = None
+
+    if "CNRM" in name:
+        driving_model = "CNRM-CM5"
+    if "CanESM2" in name:
+        driving_model = "CanESM2"
+    if "GFDL" in name:
+        driving_model = "GFDL-ESM2M"
+    if "HadGEM2" in name:
+        driving_model = "HadGEM2-ES"
+    if "MPI_ESM_LR" in name or "MPI-ESM-LR" in name:
+        driving_model = "MPI-ESM-LR"
+    if "MPI_ESM_MR" in name or "MPI-ESM-MR" in name:
+        driving_model = "MPI-ESM-MR"
+
+    if driving_model in cmip5_pr_dict:
+        cordex_ds = xr.open_dataset(f)
+        cmip5_ds = xr.open_dataset(cmip5_pr_dict[driving_model])
+
+        if "height" in cordex_ds.coords:
+            cordex_ds = cordex_ds.drop_vars("height")
+
+        if "height" in cmip5_ds.coords:
+            cmip5_ds = cmip5_ds.drop_vars("height")
+
+        # Convert precipitation from rate to monthly totals.
+        cordex_one = (cordex_ds.pr * 86400 * days_in_month).mean("month")
+        cmip5_one = (cmip5_ds.pr * 86400 * days_in_month).mean("month")
+
+        cordex_one, cmip5_one = xr.align(cordex_one, cmip5_one, join="inner")
+
+        paired_pr_diffs.append(cordex_one - cmip5_one)
+        paired_pr_names.append(name.replace(".nc", ""))
+
+paired_pr_diffs = xr.concat(
+    paired_pr_diffs,
+    dim="pair",
+    coords="minimal",
+    compat="override"
+)
+
+paired_pr_diffs = paired_pr_diffs.assign_coords(pair=paired_pr_names)
+
+pr_diff_paired_mean = paired_pr_diffs.mean("pair").compute()
+
+pr_ttest_paired = stats.ttest_1samp(
+    paired_pr_diffs.transpose("pair", "lat", "lon").values,
+    0,
+    axis=0,
+    nan_policy="omit"
+)
+
+pvalue_pr_paired = xr.DataArray(
+    pr_ttest_paired.pvalue,
+    coords={"lat": pr_diff_paired_mean.lat, "lon": pr_diff_paired_mean.lon},
+    dims=["lat", "lon"]
+)
+
+pvalue_pr_paired = pvalue_pr_paired.fillna(1)
+
+print("Number of matched Pr pairs:")
+print(len(paired_pr_names))
+
+print("Paired Pr difference min/max/mean:")
+print(
+    float(pr_diff_paired_mean.min()),
+    float(pr_diff_paired_mean.max()),
+    float(pr_diff_paired_mean.mean())
+)
+
+print("Paired Pr p-value min/max/mean:")
+print(
+    float(pvalue_pr_paired.min()),
+    float(pvalue_pr_paired.max()),
+    float(pvalue_pr_paired.mean())
+)
+
+print("Paired Pr percent significant:")
+print(float((pvalue_pr_paired < 0.05).mean() * 100))
+
+
+# ------------------------------------------------------------
+# 17. Plot paired precipitation difference with significance hatching
+# ------------------------------------------------------------
+
+fig, ax = plt.subplots(
+    1,
+    1,
+    subplot_kw={"projection": ccrs.PlateCarree()},
+    figsize=(6, 5)
+)
+
+# Fixed scale used for precipitation difference plot.
+pr_pair_diff_min = -40
+pr_pair_diff_max = 40
+
+pr_pair_levels = np.arange(pr_pair_diff_min, pr_pair_diff_max + 5, 5)
+pr_pair_ticks = np.arange(pr_pair_diff_min, pr_pair_diff_max + 10, 10)
+
+add_map_features(ax)
+
+pc = ax.contourf(
+    pr_diff_paired_mean.lon,
+    pr_diff_paired_mean.lat,
+    pr_diff_paired_mean,
+    cmap="RdBu_r",
+    levels=pr_pair_levels,
+    extend="neither"
+)
+
+# Hatched areas indicate where p < 0.05.
+ax.contourf(
+    pvalue_pr_paired.lon,
+    pvalue_pr_paired.lat,
+    pvalue_pr_paired,
+    levels=[0, 0.05, 1],
+    colors="none",
+    hatches=["//", ""],
+    alpha=0
+)
+
+cax, kw = mpl.colorbar.make_axes(ax, location="bottom", pad=0.07, shrink=1)
+
+out = fig.colorbar(
+    pc,
+    cax=cax,
+    extend="neither",
+    boundaries=pr_pair_levels,
+    ticks=pr_pair_ticks,
+    **kw
+)
+
+out.set_label("CORDEX - CMIP5 Pr difference (mm/month)", size=10)
+pc.set_clim(pr_pair_diff_min, pr_pair_diff_max)
+
+ax.set_title("CORDEX - CMIP5 Pr T test", size=14)
+
+plt.savefig(f"{figure_dir}/CORDEX_minus_CMIP5_Pr_ttest.png", dpi=300, bbox_inches="tight")
+plt.show()
+
+
+# ------------------------------------------------------------
+# 18. End of script
+# ------------------------------------------------------------
+
+print("Climatology, difference, and paired t-test plots complete.")
