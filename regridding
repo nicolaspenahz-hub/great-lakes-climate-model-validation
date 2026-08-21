@@ -1,0 +1,161 @@
+# ------------------------------------------------------------
+# Regrid CaSR variables to the Great Lakes analysis grid
+# ------------------------------------------------------------
+#
+# This script downloads CaSR data from the PAVICS/Ouranos THREDDS
+# catalogue, subsets the data to the Great Lakes region, and regrids
+# selected variables to a regular 0.25-degree latitude/longitude grid.
+#
+# The regridded CaSR files are saved as NetCDF files and can then be
+# used for comparison with CORDEX, ERA-Interim-driven CORDEX, and CMIP5.
+# ------------------------------------------------------------
+
+from siphon.catalog import TDSCatalog
+import xarray as xr
+import numpy as np
+import xesmf as xe
+import xscen as xs
+from clisops.core import subset
+import os
+
+
+# ------------------------------------------------------------
+# 1. Open the PAVICS reanalysis catalogue
+# ------------------------------------------------------------
+
+url = "https://pavics.ouranos.ca/twitcher/ows/proxy/thredds/catalog/datasets/reanalyses/catalog.xml"
+cat = TDSCatalog(url)
+
+# CaSR daily dataset from 1980 to 2024
+ncml_file = "day_NAM_GovCan_CaSR_v32_1980-2024.ncml"
+
+
+# ------------------------------------------------------------
+# 2. Get the OpenDAP link for the CaSR dataset
+# ------------------------------------------------------------
+
+opendap_urls = [cat.datasets[x].access_urls["OpenDAP"] for x in cat.datasets]
+
+# Keep only the CaSR file needed for this project
+opendap_urls = [o for o in opendap_urls if o.split("/")[-1] == ncml_file]
+
+print("OpenDAP files found:")
+print(opendap_urls)
+
+
+# ------------------------------------------------------------
+# 3. Open the CaSR dataset
+# ------------------------------------------------------------
+
+# Chunking is used because the full CaSR dataset is large
+chunks = {"time": 1461, "rlat": 50, "rlon": 50}
+
+for od in opendap_urls:
+    ds = xr.open_dataset(od, chunks=chunks, decode_timedelta=False)
+
+
+# ------------------------------------------------------------
+# 4. Subset CaSR to the Great Lakes region
+# ------------------------------------------------------------
+
+# Wider bounds are used before regridding so that the final grid
+# fully covers the Great Lakes region.
+lon_bnds = [-97, -72]
+lat_bnds = [39, 52]
+
+ds_gl = subset.subset_bbox(ds, lon_bnds=lon_bnds, lat_bnds=lat_bnds)
+
+
+# ------------------------------------------------------------
+# 5. Create a mask from the first time step
+# ------------------------------------------------------------
+
+# This mask identifies valid CaSR grid cells. It is useful because
+# the original CaSR data are on a rotated grid and may include
+# missing values outside the analysis region.
+ds_gl["mask"] = ~np.isnan(ds_gl.tas.isel(time=0).squeeze())
+
+
+# ------------------------------------------------------------
+# 6. Create the regular 0.25-degree Great Lakes output grid
+# ------------------------------------------------------------
+
+# The output grid is chosen to match the Great Lakes grid used for
+# comparison with the NA-CORDEX and CMIP5 datasets.
+cell_res = 0.25
+
+lon0, lon1 = (-95.125, -75.0)
+lat0, lat1 = (40.0, 50.0)
+
+outgrid = xe.util.cf_grid_2d(
+    lon0,
+    lon1,
+    cell_res,
+    lat0,
+    lat1,
+    cell_res
+)
+
+
+# ------------------------------------------------------------
+# 7. Choose variables to regrid
+# ------------------------------------------------------------
+
+# tas    = average surface air temperature
+# tasmin = daily minimum surface air temperature
+# tasmax = daily maximum surface air temperature
+# pr     = precipitation rate
+# sftlkf = lake fraction
+vars_to_regrid = ["tas", "tasmin", "tasmax", "pr", "sftlkf"]
+
+
+# ------------------------------------------------------------
+# 8. Add rotated-pole grid bounds
+# ------------------------------------------------------------
+
+# Conservative regridding needs grid-cell bounds. CaSR is on a rotated
+# pole grid, so xscen is used to create the required bounds.
+ds_gl = ds_gl.assign_coords(**xs.regrid.create_bounds_rotated_pole(ds_gl))
+
+
+# ------------------------------------------------------------
+# 9. Regrid each variable and save the output
+# ------------------------------------------------------------
+
+for var in vars_to_regrid:
+    print("----------------------------------------")
+    print(f"Regridding variable: {var}")
+
+    # Create output folder for this variable
+    output_dir = f"/export/data/CaSR/daily/{var}"
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Create conservative regridder
+    regridder = xe.Regridder(
+        ds_gl,
+        outgrid,
+        "conservative_normed",
+        unmapped_to_nan=True
+    )
+
+    print("Regridding in progress...")
+
+    # Apply the regridder to the selected variable
+    regridded = regridder(ds_gl[var])
+
+    print("Regridding complete.")
+
+    # Convert DataArray back to Dataset before saving
+    regridded = regridded.to_dataset(name=var)
+
+    # Save the regridded variable as a NetCDF file
+    output_file = f"{output_dir}/{var}_GLR_remap_daily.nc"
+
+    print(f"Saving to: {output_file}")
+    regridded.to_netcdf(output_file)
+
+    # Delete regridder before moving to the next variable
+    del regridder
+
+print("----------------------------------------")
+print("All selected CaSR variables have been regridded.")
