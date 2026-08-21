@@ -1,0 +1,635 @@
+# ------------------------------------------------------------
+# Lake-land masking and diurnal temperature range analysis
+# ------------------------------------------------------------
+#
+# This script calculates seasonal over-lake and over-land diurnal
+# temperature range (DTR) for CaSR, CORDEX, ERAI-CORDEX, and CMIP5.
+#
+# DTR is calculated as:
+#
+# DTR = tasmax - tasmin
+#
+# The goal is to compare how strongly each dataset represents the
+# moderating effect of the Great Lakes on daily temperature range.
+# ------------------------------------------------------------
+
+
+# ------------------------------------------------------------
+# 1. Import packages
+# ------------------------------------------------------------
+
+import os
+
+import numpy as np
+import pandas as pd
+import xarray as xr
+
+import matplotlib.pyplot as plt
+import matplotlib as mpl
+
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+
+from scipy import stats
+
+
+# ------------------------------------------------------------
+# 2. Helper functions
+# ------------------------------------------------------------
+
+def add_model_id(ds):
+    """
+    Add model_id as a coordinate called model.
+
+    This is used when opening multiple CORDEX or CMIP5 files with
+    xarray.open_mfdataset so that each file is tracked by model name.
+    """
+    ds.coords["model"] = ds.attrs["model_id"]
+    return ds
+
+
+def convert_month_to_datetime(data):
+    """
+    Convert the month coordinate from integers to datetime values.
+
+    This allows xarray to group monthly climatology data into seasons
+    using groupby("month.season").
+    """
+    data = data.copy()
+    data["month"] = np.asarray(pd.date_range("2000-01-01", periods=12, freq="MS").values)
+    return data
+
+
+def sftlf_avg(Z, lmask):
+    """
+    Calculate seasonal over-lake and over-land averages using CORDEX sftlf.
+
+    Parameters
+    ----------
+    Z : xarray.DataArray
+        Monthly climatology variable, such as DTR.
+    lmask : xarray.DataArray
+        CORDEX land fraction mask. Values range from 0 to 100.
+
+    Returns
+    -------
+    overlake_mean, overland_mean : xarray.DataArray
+        Seasonal averages over lake and land grid cells.
+
+    Notes
+    -----
+    For CORDEX sftlf:
+    - values below 50 are treated as lake grid cells
+    - values greater than or equal to 50 are treated as land grid cells
+    """
+    Z_seasons = Z.groupby("month.season").mean("month")
+
+    if "time" in lmask.dims:
+        lmask = lmask.isel(time=0)
+
+    lake_mask = Z_seasons.where(lmask < 50)
+    land_mask = Z_seasons.where(lmask >= 50)
+
+    overlake_mean = lake_mask.mean(dim=["lat", "lon"])
+    overland_mean = land_mask.mean(dim=["lat", "lon"])
+
+    return overlake_mean, overland_mean
+
+
+def sftlkf_avg(Z, lmask):
+    """
+    Calculate seasonal over-lake and over-land averages using CaSR sftlkf.
+
+    Parameters
+    ----------
+    Z : xarray.DataArray
+        Monthly climatology variable, such as DTR.
+    lmask : xarray.DataArray
+        CaSR lake fraction mask. Values range from 0 to 1.
+
+    Returns
+    -------
+    overlake_mean, overland_mean : xarray.DataArray
+        Seasonal averages over lake and land grid cells.
+
+    Notes
+    -----
+    For CaSR sftlkf:
+    - values greater than or equal to 0.5 are treated as lake grid cells
+    - values below 0.5 are treated as land grid cells
+    """
+    Z_seasons = Z.groupby("month.season").mean("month")
+
+    if "time" in lmask.dims:
+        lmask = lmask.isel(time=0)
+
+    lake_mask = Z_seasons.where(lmask >= 0.5)
+    land_mask = Z_seasons.where(lmask < 0.5)
+
+    overlake_mean = lake_mask.mean(dim=["lat", "lon"])
+    overland_mean = land_mask.mean(dim=["lat", "lon"])
+
+    return overlake_mean, overland_mean
+
+
+def apply_sftlf_to_members(data, mask_data):
+    """
+    Apply the CORDEX land fraction mask to each model member.
+
+    This function loops through each model member, calculates seasonal
+    over-lake and over-land averages, and combines the results along
+    a new member dimension.
+    """
+    overlake_mean = []
+    overland_mean = []
+
+    for i in range(len(data.model)):
+        lake_i, land_i = sftlf_avg(data[i], mask_data["sftlf"][i])
+
+        lake_i = lake_i.drop_vars("model", errors="ignore")
+        land_i = land_i.drop_vars("model", errors="ignore")
+
+        overlake_mean.append(lake_i)
+        overland_mean.append(land_i)
+
+    overlake_mean = xr.concat(overlake_mean, dim="member")
+    overland_mean = xr.concat(overland_mean, dim="member")
+
+    return overlake_mean, overland_mean
+
+
+def apply_sftlkf_to_members(data, mask_data):
+    """
+    Apply the CaSR lake fraction mask to each model member.
+
+    This is used for CMIP5 because the CaSR lake mask is on the same
+    Great Lakes grid used for the CMIP5 comparison.
+    """
+    overlake_mean = []
+    overland_mean = []
+
+    for i in range(len(data.model)):
+        lake_i, land_i = sftlkf_avg(data[i], mask_data["sftlkf"])
+
+        lake_i = lake_i.drop_vars("model", errors="ignore")
+        land_i = land_i.drop_vars("model", errors="ignore")
+
+        overlake_mean.append(lake_i)
+        overland_mean.append(land_i)
+
+    overlake_mean = xr.concat(overlake_mean, dim="member")
+    overland_mean = xr.concat(overland_mean, dim="member")
+
+    return overlake_mean, overland_mean
+
+
+def confidence_interval(data):
+    """
+    Calculate the 95% confidence interval across ensemble members.
+
+    The confidence interval is calculated using the t distribution.
+    """
+    n = data.sizes["member"]
+    tcrit = stats.t.ppf(0.975, n - 1)
+
+    ci = tcrit * data.std("member", ddof=1) / np.sqrt(n)
+
+    return ci
+
+
+# ------------------------------------------------------------
+# 3. File paths
+# ------------------------------------------------------------
+
+# CaSR files
+casr_tasmax_file = "/export/data/CaSR/daily/tasmax/tasmax_GLR_remap_daily.nc"
+casr_tasmin_file = "/export/data/CaSR/daily/tasmin/tasmin_GLR_remap_daily.nc"
+casr_lake_mask_file = "/export/data/CaSR/daily/sftlkf/sftlkf_GLR_remap_daily.nc"
+
+# CORDEX land fraction masks
+sftlf_path = "/export/data/NA-CORDEX/fixed/sftlf/GL/*.nc"
+
+# CORDEX monthly climatology files
+cordex_tasmax_path = "/export/data/NA-CORDEX/daily/tasmax/remap/GL/monthly/average/ANN/*CLIM.nc"
+cordex_tasmin_path = "/export/data/NA-CORDEX/daily/tasmin/remap/GL/monthly/average/ANN/*CLIM.nc"
+
+# ERAI-CORDEX monthly climatology files
+erai_tasmax_path = "/export/data/ERAI/NA-CORDEX/remap/GL/monthly/average/ANN/tasmax/*CLIM.nc"
+erai_tasmin_path = "/export/data/ERAI/NA-CORDEX/remap/GL/monthly/average/ANN/tasmin/*CLIM.nc"
+
+# CMIP5 monthly climatology files
+cmip5_tasmax_path = "/export/data/CMIP5/NA-CORDEX/historical/tasmax/GL/monthly/average/ANN/*CLIM_remap.nc"
+cmip5_tasmin_path = "/export/data/CMIP5/NA-CORDEX/historical/tasmin/GL/monthly/average/ANN/*CLIM_remap.nc"
+
+# Folder where figures are saved
+figure_dir = "../figures"
+os.makedirs(figure_dir, exist_ok=True)
+
+
+# ------------------------------------------------------------
+# 4. Load masks
+# ------------------------------------------------------------
+
+# CORDEX land fraction mask.
+# sftlf values range from 0 to 100.
+# Values below 50 are treated as lake and values >= 50 as land.
+sftlf_mods = xr.open_mfdataset(
+    sftlf_path,
+    combine="nested",
+    concat_dim="model",
+    preprocess=add_model_id,
+    data_vars="minimal",
+    coords="minimal",
+    compat="override"
+)
+
+# CaSR lake fraction mask.
+# sftlkf values range from 0 to 1.
+# Values >= 0.5 are treated as lake and values < 0.5 as land.
+casr_lmask = xr.open_dataset(casr_lake_mask_file)
+
+
+# ------------------------------------------------------------
+# 5. Load CaSR tasmax and tasmin
+# ------------------------------------------------------------
+
+# CaSR is daily, so it is first limited to the historical period.
+tasmax_casr = xr.open_dataset(casr_tasmax_file).sel(time=slice("1980-01-01", "2005-12-31"))
+tasmin_casr = xr.open_dataset(casr_tasmin_file).sel(time=slice("1980-01-01", "2005-12-31"))
+
+
+# ------------------------------------------------------------
+# 6. Calculate CaSR DTR
+# ------------------------------------------------------------
+
+# DTR is calculated as daily maximum temperature minus daily minimum temperature.
+# Since both variables are in Kelvin, the difference is equivalent to degrees Celsius.
+dtr_casr = tasmax_casr["tasmax"] - tasmin_casr["tasmin"]
+
+# Calculate monthly climatological DTR from the daily CaSR data.
+dtr_casr_mon = dtr_casr.groupby("time.month").mean("time")
+
+# Convert the month coordinate so seasonal averaging works correctly.
+dtr_casr_mon = convert_month_to_datetime(dtr_casr_mon)
+
+# Calculate seasonal over-lake and over-land CaSR DTR.
+casr_dtr_overlake_mean, casr_dtr_overland_mean = sftlkf_avg(
+    dtr_casr_mon,
+    casr_lmask["sftlkf"]
+)
+
+
+# ------------------------------------------------------------
+# 7. Load CORDEX, ERAI-CORDEX, and CMIP5 tasmax/tasmin
+# ------------------------------------------------------------
+
+tasmax_cordex = xr.open_mfdataset(
+    cordex_tasmax_path,
+    combine="nested",
+    concat_dim="model",
+    preprocess=add_model_id,
+    data_vars="minimal",
+    coords="minimal",
+    compat="override"
+)
+
+tasmin_cordex = xr.open_mfdataset(
+    cordex_tasmin_path,
+    combine="nested",
+    concat_dim="model",
+    preprocess=add_model_id,
+    data_vars="minimal",
+    coords="minimal",
+    compat="override"
+)
+
+tasmax_cordex_ERAI = xr.open_mfdataset(
+    erai_tasmax_path,
+    combine="nested",
+    concat_dim="model",
+    preprocess=add_model_id,
+    data_vars="minimal",
+    coords="minimal",
+    compat="override"
+)
+
+tasmin_cordex_ERAI = xr.open_mfdataset(
+    erai_tasmin_path,
+    combine="nested",
+    concat_dim="model",
+    preprocess=add_model_id,
+    data_vars="minimal",
+    coords="minimal",
+    compat="override"
+)
+
+tasmax_cmip5 = xr.open_mfdataset(
+    cmip5_tasmax_path,
+    combine="nested",
+    concat_dim="model",
+    preprocess=add_model_id,
+    data_vars="minimal",
+    coords="minimal",
+    compat="override"
+)
+
+tasmin_cmip5 = xr.open_mfdataset(
+    cmip5_tasmin_path,
+    combine="nested",
+    concat_dim="model",
+    preprocess=add_model_id,
+    data_vars="minimal",
+    coords="minimal",
+    compat="override"
+)
+
+
+# ------------------------------------------------------------
+# 8. Calculate model DTR
+# ------------------------------------------------------------
+
+# DTR is calculated directly from tasmax and tasmin.
+# The units are Kelvin difference, which is numerically the same as degrees Celsius.
+dtr_cordex = tasmax_cordex["tasmax"] - tasmin_cordex["tasmin"]
+dtr_cordex_ERAI = tasmax_cordex_ERAI["tasmax"] - tasmin_cordex_ERAI["tasmin"]
+dtr_cmip5 = tasmax_cmip5["tasmax"] - tasmin_cmip5["tasmin"]
+
+# Convert month coordinates to datetime values so xarray can group by season.
+dtr_cordex = convert_month_to_datetime(dtr_cordex)
+dtr_cordex_ERAI = convert_month_to_datetime(dtr_cordex_ERAI)
+dtr_cmip5 = convert_month_to_datetime(dtr_cmip5)
+
+
+# ------------------------------------------------------------
+# 9. Calculate over-lake and over-land DTR for each model dataset
+# ------------------------------------------------------------
+
+# CORDEX and ERAI-CORDEX use the CORDEX land fraction masks.
+cordex_dtr_overlake_mean, cordex_dtr_overland_mean = apply_sftlf_to_members(
+    dtr_cordex,
+    sftlf_mods
+)
+
+erai_dtr_overlake_mean, erai_dtr_overland_mean = apply_sftlf_to_members(
+    dtr_cordex_ERAI,
+    sftlf_mods
+)
+
+# CMIP5 uses the CaSR lake fraction mask because it is on the same
+# comparison grid as the regridded CaSR data.
+cmip5_dtr_overlake_mean, cmip5_dtr_overland_mean = apply_sftlkf_to_members(
+    dtr_cmip5,
+    casr_lmask
+)
+
+
+# ------------------------------------------------------------
+# 10. Reorder seasons
+# ------------------------------------------------------------
+
+season_order = ["DJF", "MAM", "JJA", "SON"]
+
+casr_lake = casr_dtr_overlake_mean.sel(season=season_order).compute()
+casr_land = casr_dtr_overland_mean.sel(season=season_order).compute()
+
+cordex_lake_mean = cordex_dtr_overlake_mean.sel(season=season_order).mean("member").compute()
+cordex_land_mean = cordex_dtr_overland_mean.sel(season=season_order).mean("member").compute()
+
+erai_lake_mean = erai_dtr_overlake_mean.sel(season=season_order).mean("member").compute()
+erai_land_mean = erai_dtr_overland_mean.sel(season=season_order).mean("member").compute()
+
+cmip5_lake_mean = cmip5_dtr_overlake_mean.sel(season=season_order).mean("member").compute()
+cmip5_land_mean = cmip5_dtr_overland_mean.sel(season=season_order).mean("member").compute()
+
+
+# ------------------------------------------------------------
+# 11. Calculate 95% confidence intervals
+# ------------------------------------------------------------
+
+# CaSR is the reference dataset, so no ensemble confidence interval
+# is shown for CaSR.
+cordex_lake_ci = confidence_interval(cordex_dtr_overlake_mean.sel(season=season_order)).compute()
+cordex_land_ci = confidence_interval(cordex_dtr_overland_mean.sel(season=season_order)).compute()
+
+erai_lake_ci = confidence_interval(erai_dtr_overlake_mean.sel(season=season_order)).compute()
+erai_land_ci = confidence_interval(erai_dtr_overland_mean.sel(season=season_order)).compute()
+
+cmip5_lake_ci = confidence_interval(cmip5_dtr_overlake_mean.sel(season=season_order)).compute()
+cmip5_land_ci = confidence_interval(cmip5_dtr_overland_mean.sel(season=season_order)).compute()
+
+
+# ------------------------------------------------------------
+# 12. Create DTR table
+# ------------------------------------------------------------
+
+dtr_table = pd.DataFrame({
+    "season": season_order,
+
+    "CaSR_lake": casr_lake.values,
+    "CaSR_land": casr_land.values,
+
+    "CORDEX_lake": cordex_lake_mean.values,
+    "CORDEX_land": cordex_land_mean.values,
+
+    "ERAI_CORDEX_lake": erai_lake_mean.values,
+    "ERAI_CORDEX_land": erai_land_mean.values,
+
+    "CMIP5_lake": cmip5_lake_mean.values,
+    "CMIP5_land": cmip5_land_mean.values
+})
+
+print("Seasonal lake-land DTR table:")
+print(dtr_table)
+
+
+# ------------------------------------------------------------
+# 13. Print lake-land differences
+# ------------------------------------------------------------
+
+print("")
+print("Land minus lake DTR differences")
+print("CaSR:")
+print((casr_land - casr_lake).compute())
+
+print("")
+print("CORDEX:")
+print((cordex_land_mean - cordex_lake_mean).compute())
+
+print("")
+print("ERAI-CORDEX:")
+print((erai_land_mean - erai_lake_mean).compute())
+
+print("")
+print("CMIP5:")
+print((cmip5_land_mean - cmip5_lake_mean).compute())
+
+
+# ------------------------------------------------------------
+# 14. Diagnostic mask checks
+# ------------------------------------------------------------
+
+print("")
+print("Mask checks")
+
+print("CaSR lake mask min:", float(casr_lmask.sftlkf.min()))
+print("CaSR lake mask max:", float(casr_lmask.sftlkf.max()))
+print("CaSR lake mask mean:", float(casr_lmask.sftlkf.mean()))
+
+casr_lake_cells = (casr_lmask.sftlkf >= 0.5).sum()
+casr_land_cells = (casr_lmask.sftlkf < 0.5).sum()
+
+print("CaSR lake cells:", int(casr_lake_cells))
+print("CaSR land cells:", int(casr_land_cells))
+
+print("CORDEX sftlf min:", float(sftlf_mods.sftlf.min()))
+print("CORDEX sftlf max:", float(sftlf_mods.sftlf.max()))
+print("CORDEX sftlf mean:", float(sftlf_mods.sftlf.mean()))
+
+cordex_lake_cells = (sftlf_mods.sftlf[0].isel(time=0) < 50).sum()
+cordex_land_cells = (sftlf_mods.sftlf[0].isel(time=0) >= 50).sum()
+
+print("CORDEX lake cells for first model:", int(cordex_lake_cells))
+print("CORDEX land cells for first model:", int(cordex_land_cells))
+
+print("")
+print("Ensemble member counts")
+print("CORDEX members:", cordex_dtr_overlake_mean.sizes["member"])
+print("ERAI-CORDEX members:", erai_dtr_overlake_mean.sizes["member"])
+print("CMIP5 members:", cmip5_dtr_overlake_mean.sizes["member"])
+
+
+# ------------------------------------------------------------
+# 15. Plot final seasonal DTR figure
+# ------------------------------------------------------------
+
+fig, ax = plt.subplots(
+    1,
+    4,
+    figsize=(18, 5),
+    sharey=True
+)
+
+group_x = np.array([0, 1])
+width = 0.18
+
+season_titles = [
+    "a) DJF Over-lake and Over-land DTR",
+    "b) MAM Over-lake and Over-land DTR",
+    "c) JJA Over-lake and Over-land DTR",
+    "d) SON Over-lake and Over-land DTR"
+]
+
+for i in range(4):
+
+    # CaSR bars do not have confidence intervals because CaSR is not
+    # an ensemble in this analysis.
+    ax[i].bar(
+        group_x[0] - 1.5 * width,
+        float(casr_lake.sel(season=season_order[i])),
+        width,
+        color="black",
+        edgecolor="black",
+        label="CaSR" if i == 0 else ""
+    )
+
+    ax[i].bar(
+        group_x[1] - 1.5 * width,
+        float(casr_land.sel(season=season_order[i])),
+        width,
+        color="black",
+        edgecolor="black"
+    )
+
+    # CORDEX bars with 95% confidence intervals.
+    ax[i].bar(
+        group_x[0] - 0.5 * width,
+        float(cordex_lake_mean.sel(season=season_order[i])),
+        width,
+        yerr=float(cordex_lake_ci.sel(season=season_order[i])),
+        capsize=3,
+        color="red",
+        edgecolor="red",
+        alpha=0.8,
+        label="CORDEX" if i == 0 else ""
+    )
+
+    ax[i].bar(
+        group_x[1] - 0.5 * width,
+        float(cordex_land_mean.sel(season=season_order[i])),
+        width,
+        yerr=float(cordex_land_ci.sel(season=season_order[i])),
+        capsize=3,
+        color="red",
+        edgecolor="red",
+        alpha=0.8
+    )
+
+    # ERAI-CORDEX bars with 95% confidence intervals.
+    ax[i].bar(
+        group_x[0] + 0.5 * width,
+        float(erai_lake_mean.sel(season=season_order[i])),
+        width,
+        yerr=float(erai_lake_ci.sel(season=season_order[i])),
+        capsize=3,
+        color="darkkhaki",
+        edgecolor="darkkhaki",
+        alpha=0.9,
+        label="ERAI" if i == 0 else ""
+    )
+
+    ax[i].bar(
+        group_x[1] + 0.5 * width,
+        float(erai_land_mean.sel(season=season_order[i])),
+        width,
+        yerr=float(erai_land_ci.sel(season=season_order[i])),
+        capsize=3,
+        color="darkkhaki",
+        edgecolor="darkkhaki",
+        alpha=0.9
+    )
+
+    # CMIP5 bars with 95% confidence intervals.
+    ax[i].bar(
+        group_x[0] + 1.5 * width,
+        float(cmip5_lake_mean.sel(season=season_order[i])),
+        width,
+        yerr=float(cmip5_lake_ci.sel(season=season_order[i])),
+        capsize=3,
+        color="blue",
+        edgecolor="blue",
+        alpha=0.8,
+        label="CMIP5" if i == 0 else ""
+    )
+
+    ax[i].bar(
+        group_x[1] + 1.5 * width,
+        float(cmip5_land_mean.sel(season=season_order[i])),
+        width,
+        yerr=float(cmip5_land_ci.sel(season=season_order[i])),
+        capsize=3,
+        color="blue",
+        edgecolor="blue",
+        alpha=0.8
+    )
+
+    ax[i].set_xticks(group_x)
+    ax[i].set_xticklabels(["Overlake", "Overland"])
+    ax[i].set_ylim(0, 12)
+    ax[i].set_yticks(np.arange(0, 13, 2))
+    ax[i].set_title(season_titles[i], fontsize=10)
+    ax[i].tick_params(axis="both", labelsize=9)
+
+ax[0].set_ylabel("DTR ($^\\circ$C)", fontsize=10)
+ax[0].legend(loc="upper right", fontsize=9, frameon=True)
+
+plt.tight_layout()
+
+plt.savefig(f"{figure_dir}/diurnal_range.png", dpi=300, bbox_inches="tight")
+plt.show()
+
+
+# ------------------------------------------------------------
+# 16. End of script
+# ------------------------------------------------------------
+
+print("Lake-land DTR analysis complete. Figure saved to ../figures/diurnal_range.png")
