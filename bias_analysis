@@ -1,0 +1,618 @@
+# ------------------------------------------------------------
+# Bias analysis for CaSR, CORDEX, ERAI-CORDEX, and CMIP5
+# ------------------------------------------------------------
+#
+# This script calculates and plots the main bias components used in
+# the project:
+#
+# TB       = CORDEX - CaSR
+# SB       = ERAI-CORDEX - CaSR
+# LLBCE    = CORDEX - ERAI-CORDEX
+# GCM Bias = CMIP5 - CaSR
+#
+# Biases are calculated for:
+# - surface air temperature, tas, in degrees Celsius
+# - precipitation, pr, in mm/month
+#
+# The final figure is an 8-panel plot:
+# top row    = temperature bias components
+# bottom row = precipitation bias components
+# ------------------------------------------------------------
+
+
+# ------------------------------------------------------------
+# 1. Import packages
+# ------------------------------------------------------------
+
+import os
+import numpy as np
+import xarray as xr
+import matplotlib.pyplot as plt
+import matplotlib as mpl
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+from scipy import stats
+
+
+# ------------------------------------------------------------
+# 2. Helper functions
+# ------------------------------------------------------------
+
+def add_model_id(ds):
+    """
+    Add the model_id attribute as a model coordinate.
+
+    This is used when opening multiple climate model files with
+    xarray.open_mfdataset. It allows each file to be tracked by model name.
+    """
+    ds.coords["model"] = ds.attrs["model_id"]
+    return ds
+
+
+def add_map_features(ax):
+    """
+    Add basic map features to each panel.
+    """
+    ax.coastlines(linewidth=0.6, color="0.35")
+    ax.add_feature(cfeature.LAND)
+    ax.add_feature(cfeature.COASTLINE, linewidth=0.6, edgecolor="0.35")
+    ax.add_feature(cfeature.LAKES, linewidth=0.8, edgecolor="0.35", facecolor="none")
+
+    ax.set_xticks(np.arange(-180, 180, 5), crs=ccrs.PlateCarree())
+    ax.set_yticks(np.arange(-90, 90, 2), crs=ccrs.PlateCarree())
+
+
+def weighted_model_mean(data, weights):
+    """
+    Calculate a weighted ensemble mean.
+
+    Parameters
+    ----------
+    data : xarray.DataArray
+        Model data with a model dimension.
+    weights : dict
+        Dictionary where keys are model names and values are weights.
+
+    Returns
+    -------
+    xarray.DataArray
+        Weighted mean across the selected models.
+    """
+    weighted_sum = 0
+    total_weight = 0
+
+    for model, weight in weights.items():
+        weighted_sum = weighted_sum + data.sel(model=model) * weight
+        total_weight = total_weight + weight
+
+    return weighted_sum / total_weight
+
+
+def weighted_model_members(data, weights):
+    """
+    Create a weighted member array by repeating models according to their weights.
+
+    This is used for the Welch t-tests so that the weighted ERAI-CORDEX
+    and CMIP5 ensembles match the 11-member CORDEX construction.
+    """
+    members = []
+
+    for model, weight in weights.items():
+        for _ in range(weight):
+            members.append(data.sel(model=model))
+
+    weighted_members = xr.concat(members, dim="member")
+    weighted_members = weighted_members.assign_coords(member=np.arange(len(members)))
+
+    return weighted_members
+
+
+def welch_pvalue(model_sample, reference_sample, sample_dim_model, sample_dim_reference):
+    """
+    Calculate Welch's t-test p-values at every grid cell.
+
+    This compares a model sample against a reference sample and returns
+    a p-value map. Values below 0.05 are treated as statistically significant.
+    """
+    model_sample, reference_sample = xr.align(
+        model_sample,
+        reference_sample,
+        join="inner"
+    )
+
+    result = stats.ttest_ind(
+        model_sample.transpose(sample_dim_model, "lat", "lon").values,
+        reference_sample.transpose(sample_dim_reference, "lat", "lon").values,
+        axis=0,
+        equal_var=False,
+        nan_policy="omit"
+    )
+
+    pvalue = xr.DataArray(
+        result.pvalue,
+        coords={"lat": model_sample.lat, "lon": model_sample.lon},
+        dims=["lat", "lon"]
+    )
+
+    return pvalue.fillna(1)
+
+
+# ------------------------------------------------------------
+# 3. File paths
+# ------------------------------------------------------------
+
+# CaSR reference files
+casr_tas_file = "/export/data/CaSR/daily/tas/tas_GLR_remap_daily.nc"
+casr_pr_file = "/export/data/CaSR/daily/pr/pr_GLR_remap_daily.nc"
+
+# CORDEX historical files
+cordex_tas_path = "/export/data/NA-CORDEX/daily/tas/remap/GL/monthly/average/ANN/*CLIM.nc"
+cordex_pr_path = "/export/data/NA-CORDEX/mon/pr/remap/mon/ANN/*CLIM_remap.nc"
+
+# ERA-Interim-driven CORDEX files
+erai_tas_path = "/export/data/ERAI/NA-CORDEX/remap/GL/monthly/average/ANN/tas/*CLIM.nc"
+erai_pr_path = "/export/data/ERAI/NA-CORDEX/pr/remap/GL/monthly/average/*CLIM.nc"
+
+# CMIP5 files
+cmip5_tas_path = "/export/data/CMIP5/NA-CORDEX/historical/tas/GL/monthly/average/ANN/*CLIM_remap.nc"
+cmip5_pr_path = "/export/data/CMIP5/NA-CORDEX/historical/pr/GL/monthly/average/*CLIM_remap.nc"
+
+# Folder where figures are saved
+figure_dir = "../figures"
+os.makedirs(figure_dir, exist_ok=True)
+
+
+# ------------------------------------------------------------
+# 4. Load CaSR reference data
+# ------------------------------------------------------------
+
+# CaSR is daily, so it is first limited to the historical period
+# used in the study.
+tas_casr = xr.open_dataset(casr_tas_file).sel(time=slice("1980-01-01", "2005-12-31"))
+pr_casr = xr.open_dataset(casr_pr_file).sel(time=slice("1980-01-01", "2005-12-31"))
+
+# Monthly climatologies are calculated by averaging all Januaries,
+# all Februaries, and so on across 1980-2005.
+tas_mon = tas_casr.groupby("time.month").mean("time")
+pr_mon = pr_casr.groupby("time.month").mean("time")
+
+
+# ------------------------------------------------------------
+# 5. Load CORDEX, ERAI-CORDEX, and CMIP5 climatologies
+# ------------------------------------------------------------
+
+tas_cordex = xr.open_mfdataset(
+    cordex_tas_path,
+    combine="nested",
+    concat_dim="model",
+    preprocess=add_model_id,
+    data_vars="minimal",
+    coords="minimal",
+    compat="override"
+)
+
+pr_cordex = xr.open_mfdataset(
+    cordex_pr_path,
+    combine="nested",
+    concat_dim="model",
+    preprocess=add_model_id,
+    data_vars="minimal",
+    coords="minimal",
+    compat="override"
+)
+
+tas_cordex_ERAI = xr.open_mfdataset(
+    erai_tas_path,
+    combine="nested",
+    concat_dim="model",
+    preprocess=add_model_id,
+    data_vars="minimal",
+    coords="minimal",
+    compat="override"
+)
+
+pr_cordex_ERAI = xr.open_mfdataset(
+    erai_pr_path,
+    combine="nested",
+    concat_dim="model",
+    preprocess=add_model_id,
+    data_vars="minimal",
+    coords="minimal",
+    compat="override"
+)
+
+tas_cmip5 = xr.open_mfdataset(
+    cmip5_tas_path,
+    combine="nested",
+    concat_dim="model",
+    preprocess=add_model_id,
+    data_vars="minimal",
+    coords="minimal",
+    compat="override"
+)
+
+pr_cmip5 = xr.open_mfdataset(
+    cmip5_pr_path,
+    combine="nested",
+    concat_dim="model",
+    preprocess=add_model_id,
+    data_vars="minimal",
+    coords="minimal",
+    compat="override"
+)
+
+
+# ------------------------------------------------------------
+# 6. Define ensemble weights
+# ------------------------------------------------------------
+
+# ERAI-CORDEX weights are based on how often each RCM appears in
+# the 11-member CORDEX ensemble.
+erai_weights = {
+    "OURANOS-CRCM5": 4,
+    "UQAM-CRCM5": 3,
+    "NCAR-RegCM4": 3,
+    "CCCma-CanRCM4": 1
+}
+
+# CMIP5 weights are based on how often each driving GCM appears in
+# the CORDEX ensemble.
+cmip5_weights = {
+    "HadGEM2-ES": 1,
+    "CanESM2": 3,
+    "GFDL-ESM2M": 2,
+    "CNRM-CM5": 1,
+    "MPI-ESM-LR": 3,
+    "MPI-ESM-MR": 1
+}
+
+
+# ------------------------------------------------------------
+# 7. Calculate temperature bias components
+# ------------------------------------------------------------
+
+# CaSR temperature reference.
+# Temperature is converted from Kelvin to degrees Celsius.
+obs_tas = tas_mon.tas.mean("month") - 273.15
+
+# CORDEX has one extra longitude element compared with CaSR and CMIP5,
+# so the final longitude column is dropped before comparison.
+cordex_tas_mean = (
+    tas_cordex.tas
+    .isel(lon=slice(0, -1))
+    .mean("month")
+    .mean("model")
+    - 273.15
+)
+
+# ERAI-CORDEX and CMIP5 are averaged with the weighting scheme above.
+erai_tas = tas_cordex_ERAI.tas.isel(lon=slice(0, -1)).mean("month") - 273.15
+cmip5_tas = tas_cmip5.tas.mean("month") - 273.15
+
+erai_tas_weighted = weighted_model_mean(erai_tas, erai_weights)
+cmip5_tas_weighted = weighted_model_mean(cmip5_tas, cmip5_weights)
+
+# Align all datasets to the same grid before subtracting.
+cordex_tas_mean, erai_tas_weighted, cmip5_tas_weighted, obs_tas = xr.align(
+    cordex_tas_mean,
+    erai_tas_weighted,
+    cmip5_tas_weighted,
+    obs_tas,
+    join="inner"
+)
+
+# Bias components
+TB_tas = cordex_tas_mean - obs_tas
+SB_tas = erai_tas_weighted - obs_tas
+LLBCE_tas = cordex_tas_mean - erai_tas_weighted
+cmip5_bias_tas = cmip5_tas_weighted - obs_tas
+
+
+# ------------------------------------------------------------
+# 8. Calculate precipitation bias components
+# ------------------------------------------------------------
+
+# Precipitation is provided as a rate, so it is converted to
+# monthly totals in mm/month.
+days_in_month = xr.DataArray(
+    [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31],
+    coords={"month": np.arange(1, 13)},
+    dims="month"
+)
+
+obs_pr = (pr_mon.pr * 86400 * days_in_month).mean("month")
+
+cordex_pr_mean = (
+    pr_cordex.pr
+    .isel(lon=slice(0, -1))
+    * 86400
+    * days_in_month
+).mean("month").mean("model")
+
+erai_pr = (
+    pr_cordex_ERAI.pr
+    .isel(lon=slice(0, -1))
+    * 86400
+    * days_in_month
+).mean("month")
+
+cmip5_pr = (
+    pr_cmip5.pr
+    * 86400
+    * days_in_month
+).mean("month")
+
+erai_pr_weighted = weighted_model_mean(erai_pr, erai_weights)
+cmip5_pr_weighted = weighted_model_mean(cmip5_pr, cmip5_weights)
+
+# Align all precipitation datasets to the same grid.
+cordex_pr_mean, erai_pr_weighted, cmip5_pr_weighted, obs_pr = xr.align(
+    cordex_pr_mean,
+    erai_pr_weighted,
+    cmip5_pr_weighted,
+    obs_pr,
+    join="inner"
+)
+
+# Bias components
+TB_pr = cordex_pr_mean - obs_pr
+SB_pr = erai_pr_weighted - obs_pr
+LLBCE_pr = cordex_pr_mean - erai_pr_weighted
+cmip5_bias_pr = cmip5_pr_weighted - obs_pr
+
+
+# ------------------------------------------------------------
+# 9. Print bias component summaries
+# ------------------------------------------------------------
+
+print("Tas weighted bias components")
+print("TB:", float(TB_tas.min()), float(TB_tas.max()), float(TB_tas.mean()))
+print("SB:", float(SB_tas.min()), float(SB_tas.max()), float(SB_tas.mean()))
+print("LLBCE:", float(LLBCE_tas.min()), float(LLBCE_tas.max()), float(LLBCE_tas.mean()))
+print("CMIP5 bias:", float(cmip5_bias_tas.min()), float(cmip5_bias_tas.max()), float(cmip5_bias_tas.mean()))
+
+print("")
+
+print("Pr weighted bias components")
+print("TB:", float(TB_pr.min()), float(TB_pr.max()), float(TB_pr.mean()))
+print("SB:", float(SB_pr.min()), float(SB_pr.max()), float(SB_pr.mean()))
+print("LLBCE:", float(LLBCE_pr.min()), float(LLBCE_pr.max()), float(LLBCE_pr.mean()))
+print("CMIP5 bias:", float(cmip5_bias_pr.min()), float(cmip5_bias_pr.max()), float(cmip5_bias_pr.mean()))
+
+
+# ------------------------------------------------------------
+# 10. Create samples for significance testing
+# ------------------------------------------------------------
+
+# CaSR yearly samples are used as the reference sample.
+obs_tas_years = tas_casr.tas.groupby("time.year").mean("time") - 273.15
+
+# For precipitation, calculate monthly totals first, then average by year.
+obs_pr_daily_total = pr_casr.pr * 86400
+obs_pr_years = obs_pr_daily_total.groupby("time.year").mean("time") * 30.4375
+
+# CORDEX member samples
+cordex_tas_members = tas_cordex.tas.isel(lon=slice(0, -1)).mean("month") - 273.15
+cordex_pr_members = (
+    pr_cordex.pr
+    .isel(lon=slice(0, -1))
+    * 86400
+    * days_in_month
+).mean("month")
+
+cordex_tas_members = cordex_tas_members.rename({"model": "member"})
+cordex_pr_members = cordex_pr_members.rename({"model": "member"})
+
+cordex_tas_members = cordex_tas_members.assign_coords(
+    member=np.arange(cordex_tas_members.sizes["member"])
+)
+
+cordex_pr_members = cordex_pr_members.assign_coords(
+    member=np.arange(cordex_pr_members.sizes["member"])
+)
+
+# ERAI-CORDEX weighted member samples
+erai_tas_members = tas_cordex_ERAI.tas.isel(lon=slice(0, -1)).mean("month") - 273.15
+erai_pr_members = (
+    pr_cordex_ERAI.pr
+    .isel(lon=slice(0, -1))
+    * 86400
+    * days_in_month
+).mean("month")
+
+erai_tas_weighted_members = weighted_model_members(erai_tas_members, erai_weights)
+erai_pr_weighted_members = weighted_model_members(erai_pr_members, erai_weights)
+
+# CMIP5 weighted member samples
+cmip5_tas_members = tas_cmip5.tas.mean("month") - 273.15
+cmip5_pr_members = (pr_cmip5.pr * 86400 * days_in_month).mean("month")
+
+cmip5_tas_weighted_members = weighted_model_members(cmip5_tas_members, cmip5_weights)
+cmip5_pr_weighted_members = weighted_model_members(cmip5_pr_members, cmip5_weights)
+
+# Align member arrays where needed.
+cordex_tas_members, erai_tas_weighted_members = xr.align(
+    cordex_tas_members,
+    erai_tas_weighted_members,
+    join="inner"
+)
+
+cordex_pr_members, erai_pr_weighted_members = xr.align(
+    cordex_pr_members,
+    erai_pr_weighted_members,
+    join="inner"
+)
+
+
+# ------------------------------------------------------------
+# 11. Calculate p-values using Welch's t-test
+# ------------------------------------------------------------
+
+# Temperature p-values
+pvalue_TB_tas = welch_pvalue(
+    cordex_tas_members,
+    obs_tas_years,
+    "member",
+    "year"
+)
+
+pvalue_SB_tas = welch_pvalue(
+    erai_tas_weighted_members,
+    obs_tas_years,
+    "member",
+    "year"
+)
+
+pvalue_LLBCE_tas = welch_pvalue(
+    cordex_tas_members,
+    erai_tas_weighted_members,
+    "member",
+    "member"
+)
+
+pvalue_cmip5_bias_tas = welch_pvalue(
+    cmip5_tas_weighted_members,
+    obs_tas_years,
+    "member",
+    "year"
+)
+
+# Precipitation p-values
+pvalue_TB_pr = welch_pvalue(
+    cordex_pr_members,
+    obs_pr_years,
+    "member",
+    "year"
+)
+
+pvalue_SB_pr = welch_pvalue(
+    erai_pr_weighted_members,
+    obs_pr_years,
+    "member",
+    "year"
+)
+
+pvalue_LLBCE_pr = welch_pvalue(
+    cordex_pr_members,
+    erai_pr_weighted_members,
+    "member",
+    "member"
+)
+
+pvalue_cmip5_bias_pr = welch_pvalue(
+    cmip5_pr_weighted_members,
+    obs_pr_years,
+    "member",
+    "year"
+)
+
+
+# ------------------------------------------------------------
+# 12. Print percentage of significant grid cells
+# ------------------------------------------------------------
+
+print("")
+print("Tas significant percent")
+print("TB:", float((pvalue_TB_tas < 0.05).mean() * 100))
+print("SB:", float((pvalue_SB_tas < 0.05).mean() * 100))
+print("LLBCE:", float((pvalue_LLBCE_tas < 0.05).mean() * 100))
+print("CMIP5 bias:", float((pvalue_cmip5_bias_tas < 0.05).mean() * 100))
+
+print("")
+
+print("Pr significant percent")
+print("TB:", float((pvalue_TB_pr < 0.05).mean() * 100))
+print("SB:", float((pvalue_SB_pr < 0.05).mean() * 100))
+print("LLBCE:", float((pvalue_LLBCE_pr < 0.05).mean() * 100))
+print("CMIP5 bias:", float((pvalue_cmip5_bias_pr < 0.05).mean() * 100))
+
+
+# ------------------------------------------------------------
+# 13. Plot the final 8-panel bias figure
+# ------------------------------------------------------------
+
+fig, ax = plt.subplots(
+    2,
+    4,
+    subplot_kw={"projection": ccrs.PlateCarree()},
+    figsize=(18, 10)
+)
+
+ax = ax.flatten()
+
+# Temperature color scale
+tas_color = 3
+tas_levels = np.arange(-3, 3.6, 0.6)
+tas_ticks = np.arange(-3, 3.1, 0.6)
+
+# Precipitation color scale
+pr_color = 30
+pr_levels = np.arange(-30, 36, 6)
+pr_ticks = np.arange(-30, 31, 6)
+
+# Hatching is applied where p < 0.05.
+sig_levels = [0, 0.05, 1]
+
+# Data for all panels
+plot_data = [
+    (TB_tas, pvalue_TB_tas, "CORDEX Tas TB", tas_levels, tas_ticks, tas_color, "Surface air temperature ($^oC$)"),
+    (SB_tas, pvalue_SB_tas, "CORDEX Tas SB", tas_levels, tas_ticks, tas_color, "Surface air temperature ($^oC$)"),
+    (LLBCE_tas, pvalue_LLBCE_tas, "CORDEX Tas LLBCE", tas_levels, tas_ticks, tas_color, "Surface air temperature ($^oC$)"),
+    (cmip5_bias_tas, pvalue_cmip5_bias_tas, "CMIP5 Tas GCM Bias", tas_levels, tas_ticks, tas_color, "Surface air temperature ($^oC$)"),
+    (TB_pr, pvalue_TB_pr, "CORDEX Pr TB", pr_levels, pr_ticks, pr_color, "Precipitation (mm/month)"),
+    (SB_pr, pvalue_SB_pr, "CORDEX Pr SB", pr_levels, pr_ticks, pr_color, "Precipitation (mm/month)"),
+    (LLBCE_pr, pvalue_LLBCE_pr, "CORDEX Pr LLBCE", pr_levels, pr_ticks, pr_color, "Precipitation (mm/month)"),
+    (cmip5_bias_pr, pvalue_cmip5_bias_pr, "CMIP5 Pr GCM Bias", pr_levels, pr_ticks, pr_color, "Precipitation (mm/month)")
+]
+
+for i, (data, pvalue, title, levels, ticks, color, label) in enumerate(plot_data):
+    add_map_features(ax[i])
+
+    pc = ax[i].contourf(
+        data.lon,
+        data.lat,
+        data,
+        cmap="RdBu_r",
+        levels=levels,
+        extend="neither"
+    )
+
+    # Add hatching for statistically significant areas.
+    ax[i].contourf(
+        pvalue.lon,
+        pvalue.lat,
+        pvalue,
+        levels=sig_levels,
+        colors="none",
+        hatches=["//", ""],
+        alpha=0
+    )
+
+    out = fig.colorbar(
+        pc,
+        ax=ax[i],
+        orientation="horizontal",
+        pad=0.08,
+        shrink=0.95,
+        fraction=0.08,
+        extend="neither",
+        boundaries=levels,
+        ticks=ticks
+    )
+
+    out.set_label(label, size=10)
+    pc.set_clim(-color, color)
+
+    ax[i].set_title(title, size=14)
+
+plt.subplots_adjust(wspace=0.30, hspace=0.40)
+
+plt.savefig(f"{figure_dir}/Bias.png", dpi=300, bbox_inches="tight")
+plt.show()
+
+
+# ------------------------------------------------------------
+# 14. End of script
+# ------------------------------------------------------------
+
+print("Bias analysis complete. Figure saved to ../figures/Bias.png")
